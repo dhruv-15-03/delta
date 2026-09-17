@@ -1,0 +1,237 @@
+name: MERGE pruning validation
+
+on:
+  push:
+    branches:
+      - validation/merge-pruning-20260917-78d7deb4
+    paths:
+      - .github/workflows/merge_pruning_validation.yaml
+      - spark/src/test/scala/org/apache/spark/sql/delta/commands/merge/MergeSourcePruningValidationSuite.scala
+      - spark/src/test/scala/org/apache/spark/sql/delta/commands/merge/MergeSourcePruningBenchmark.scala
+
+permissions:
+  contents: read
+
+concurrency:
+  group: merge-pruning-validation-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    if: >-
+      github.repository == 'dhruv-15-03/delta' &&
+      github.event.repository.private == false &&
+      github.run_number <= 3 &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      BASE_SHA: 1d70393ecdbdadeb633dda5106a93e5d956b0611
+      BASELINE_SUITE: org.apache.spark.sql.delta.generatedsuites.merge.MergeIntoSuiteBaseMiscSQLPathBasedSuite
+      SPARK_VERSION: "4.2"
+      TEST_PARALLELISM_COUNT: "1"
+      NUM_SHARDS: "1"
+      SPARK_LOCAL_IP: "127.0.0.1"
+    steps:
+      - name: Check out the validation commit
+        id: checkout
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify diagnostic-only changes and runner resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python3 - <<'PY'
+          import json
+          import os
+          import platform
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          output = Path("merge-pruning-results")
+          output.mkdir()
+          allowed = {
+              ".github/workflows/merge_pruning_validation.yaml",
+              "spark/src/test/scala/org/apache/spark/sql/delta/commands/merge/"
+              "MergeSourcePruningValidationSuite.scala",
+              "spark/src/test/scala/org/apache/spark/sql/delta/commands/merge/"
+              "MergeSourcePruningBenchmark.scala",
+          }
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", os.environ["BASE_SHA"], "HEAD"],
+              text=True,
+          ).splitlines()
+          unexpected = set(changed) - allowed
+          if unexpected:
+              raise SystemExit(f"Non-diagnostic changes are not allowed: {sorted(unexpected)}")
+
+          memory = dict(
+              line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines()
+          )
+          available_memory = int(memory["MemAvailable"].split()[0]) * 1024
+          free_disk = shutil.disk_usage(".").free
+          environment = {
+              "base_sha": os.environ["BASE_SHA"],
+              "validation_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_number": os.environ["GITHUB_RUN_NUMBER"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "runner_os": platform.system(),
+              "architecture": platform.machine(),
+              "image_version": os.environ.get("ImageVersion"),
+              "cpu_count": os.cpu_count(),
+              "available_memory_bytes": available_memory,
+              "free_disk_bytes": free_disk,
+              "changed_files": changed,
+              "spark_version_selector": os.environ["SPARK_VERSION"],
+              "benchmark_executed": False,
+          }
+          (output / "environment.json").write_text(
+              json.dumps(environment, indent=2) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(environment, indent=2))
+          if (os.cpu_count() or 0) < 2:
+              raise SystemExit("At least two CPUs are required.")
+          if available_memory < 10 * 1024**3 or free_disk < 10 * 1024**3:
+              raise SystemExit("Insufficient headroom for the pinned build and dependency setup.")
+          PY
+
+      - name: Install the repository-supported JDK
+        uses: actions/setup-java@17f84c3641ba7b8f6deff6309fc4c864478f5d62 # v3.14.1
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - name: Run the existing data-skipping baseline
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$GITHUB_WORKSPACE/target/validation-home"
+          export JAVA_TOOL_OPTIONS="-Duser.home=$HOME"
+          export UC_DIR="$GITHUB_WORKSPACE/target/validation-unitycatalog"
+          unset UC_REF UC_VERSION UC_REPO UC_FORCE DELTA_RELEASE_MODE SHARD_ID
+          mkdir -p "$HOME"
+          java -version > merge-pruning-results/java-version.txt 2>&1
+          sbt_args=(
+            -DsparkVersion=4.2
+            'set spark / Test / parallelExecution := false'
+            'set spark / Test / javaOptions += "-Dspark.master=local[2]"'
+            "spark/testOnly $BASELINE_SUITE -- -z \"data skipping\""
+          )
+          {
+            printf 'build/sbt'
+            printf ' %q' "${sbt_args[@]}"
+            printf '\n'
+          } | tee merge-pruning-results/command.txt
+          build/sbt "${sbt_args[@]}" 2>&1 | tee merge-pruning-baseline-full.log
+
+      - name: Require nonzero intended tests and collect bounded evidence
+        id: evidence
+        if: always() && steps.checkout.outcome == 'success'
+        shell: bash
+        env:
+          BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import xml.etree.ElementTree as ET
+          from collections import deque
+          from pathlib import Path
+
+          output = Path("merge-pruning-results")
+          output.mkdir(exist_ok=True)
+          suite = os.environ["BASELINE_SUITE"]
+          simple_name = suite.rsplit(".", 1)[-1]
+          reports = []
+          for module in ("spark-unified", "spark"):
+              target = Path(module) / "target"
+              if target.exists():
+                  reports.extend(target.rglob(f"*{simple_name}*.xml"))
+          cases = []
+          report_sources = []
+          for path in reports:
+              if path.stat().st_size > 16 * 1024**2:
+                  raise SystemExit(f"Unexpectedly large focused report: {path}")
+              root = ET.parse(path).getroot()
+              if root.tag != "testsuite" or root.get("name") not in (suite, simple_name):
+                  raise SystemExit(f"Unexpected focused report identity: {path}")
+              report_sources.append({
+                  "path": str(path),
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "size_bytes": path.stat().st_size,
+              })
+              for case in root.findall("testcase"):
+                  outcome = "passed"
+                  message = None
+                  for tag in ("skipped", "failure", "error"):
+                      detail = case.find(tag)
+                      if detail is not None:
+                          outcome = tag
+                          message = (detail.get("message") or detail.text or "")[:4096]
+                          break
+                  cases.append({
+                      "name": case.get("name", ""),
+                      "seconds": case.get("time"),
+                      "outcome": outcome,
+                      "message": message,
+                  })
+          passed = sum(case["outcome"] == "passed" for case in cases)
+          failures = sum(case["outcome"] in ("failure", "error") for case in cases)
+          unexpected = [case["name"] for case in cases if "data skipping" not in case["name"]]
+          valid = (
+              os.environ["BASELINE_OUTCOME"] == "success"
+              and len(reports) == 1
+              and passed > 0
+              and failures == 0
+              and not unexpected
+          )
+          result = {
+              "status": "passed" if valid else "failed",
+              "suite": suite,
+              "selector": "data skipping",
+              "baseline_step_outcome": os.environ["BASELINE_OUTCOME"],
+              "report_sources": report_sources,
+              "tests": len(cases) if reports else None,
+              "passed": passed if reports else None,
+              "failures": failures if reports else None,
+              "cases": cases[:100],
+              "cases_truncated": len(cases) > 100,
+              "unexpected_test_names": unexpected[:100],
+              "benchmark_executed": False,
+          }
+          (output / "baseline-report.json").write_text(
+              json.dumps(result, indent=2) + "\n", encoding="utf-8"
+          )
+          log = Path("merge-pruning-baseline-full.log")
+          if log.exists():
+              with log.open(errors="replace") as stream:
+                  tail = deque((line[-2048:] for line in stream), maxlen=350)
+              (output / "baseline-log-tail.txt").write_text(
+                  "".join(tail), encoding="utf-8"
+              )
+          print(json.dumps(result, indent=2))
+          if sum(path.stat().st_size for path in output.iterdir()) > 2 * 1024**2:
+              raise SystemExit("Diagnostic artifact exceeds the 2 MiB budget.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              stream.write("artifact_ready=true\n")
+          if not valid:
+              raise SystemExit("The intended nonzero baseline test result was not established.")
+          PY
+
+      - name: Upload small validation evidence
+        if: always() && steps.evidence.outputs.artifact_ready == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: merge-pruning-baseline-${{ github.run_id }}
+          path: merge-pruning-results/
+          retention-days: 1
+          if-no-files-found: warn
