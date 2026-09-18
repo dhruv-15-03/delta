@@ -28,6 +28,7 @@ jobs:
     env:
       BASE_SHA: 1d70393ecdbdadeb633dda5106a93e5d956b0611
       BASELINE_SUITE: org.apache.spark.sql.delta.generatedsuites.merge.MergeIntoSuiteBaseMiscSQLPathBasedSuite
+      DIAGNOSTIC_SUITE: org.apache.spark.sql.delta.commands.merge.MergeSourcePruningValidationSuite
       SPARK_VERSION: "4.2"
       TEST_PARALLELISM_COUNT: "1"
       NUM_SHARDS: "1"
@@ -131,12 +132,37 @@ jobs:
           } | tee merge-pruning-results/command.txt
           build/sbt "${sbt_args[@]}" 2>&1 | tee merge-pruning-baseline-full.log
 
+      - name: Run test-only contracts and literal-bound controls
+        id: diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$GITHUB_WORKSPACE/target/validation-home"
+          export JAVA_TOOL_OPTIONS="-Duser.home=$HOME"
+          export UC_DIR="$GITHUB_WORKSPACE/target/validation-unitycatalog"
+          unset UC_REF UC_VERSION UC_REPO UC_FORCE DELTA_RELEASE_MODE SHARD_ID
+          sbt_args=(
+            -DsparkVersion=4.2
+            'set spark / Test / parallelExecution := false'
+            'set spark / Test / javaOptions += "-Dspark.master=local[2]"'
+            "set spark / Test / javaOptions += \"-Ddelta.mergePruning.results=$GITHUB_WORKSPACE/merge-pruning-results\""
+            'spark / Test / scalastyle'
+            "spark/testOnly $DIAGNOSTIC_SUITE"
+          )
+          {
+            printf 'build/sbt'
+            printf ' %q' "${sbt_args[@]}"
+            printf '\n'
+          } | tee merge-pruning-results/diagnostic-command.txt
+          build/sbt "${sbt_args[@]}" 2>&1 | tee merge-pruning-diagnostic-full.log
+
       - name: Require nonzero intended tests and collect bounded evidence
         id: evidence
         if: always() && steps.checkout.outcome == 'success'
         shell: bash
         env:
           BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
+          DIAGNOSTIC_OUTCOME: ${{ steps.diagnostics.outcome }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -211,20 +237,71 @@ jobs:
           (output / "baseline-report.json").write_text(
               json.dumps(result, indent=2) + "\n", encoding="utf-8"
           )
-          log = Path("merge-pruning-baseline-full.log")
-          if log.exists():
-              with log.open(errors="replace") as stream:
-                  tail = deque((line[-2048:] for line in stream), maxlen=350)
-              (output / "baseline-log-tail.txt").write_text(
-                  "".join(tail), encoding="utf-8"
-              )
+          diagnostic_suite = os.environ["DIAGNOSTIC_SUITE"]
+          diagnostic_reports = list(Path("spark-unified/target").rglob(
+              f"*{diagnostic_suite.rsplit('.', 1)[-1]}*.xml"
+          ))
+          diagnostic_cases = []
+          for path in diagnostic_reports:
+              if path.stat().st_size > 16 * 1024**2:
+                  raise SystemExit(f"Unexpectedly large diagnostic report: {path}")
+              root = ET.parse(path).getroot()
+              if root.tag != "testsuite" or root.get("name") != diagnostic_suite:
+                  raise SystemExit(f"Unexpected diagnostic report identity: {path}")
+              for case in root.findall("testcase"):
+                  outcome = "passed"
+                  message = None
+                  for tag in ("skipped", "failure", "error"):
+                      detail = case.find(tag)
+                      if detail is not None:
+                          outcome = tag
+                          message = (detail.get("message") or detail.text or "")[:4096]
+                          break
+                  diagnostic_cases.append({
+                      "name": case.get("name", ""),
+                      "seconds": case.get("time"),
+                      "outcome": outcome,
+                      "message": message,
+                  })
+          diagnostic_valid = (
+              os.environ["DIAGNOSTIC_OUTCOME"] == "success"
+              and len(diagnostic_reports) == 1
+              and len(diagnostic_cases) > 0
+              and all(case["outcome"] == "passed" for case in diagnostic_cases)
+          )
+          controls = output / "literal-controls.json"
+          controls_complete = (
+              controls.exists()
+              and json.loads(controls.read_text(encoding="utf-8"))["status"] == "complete"
+          )
+          diagnostic_result = {
+              "status": "passed" if diagnostic_valid else "failed",
+              "suite": diagnostic_suite,
+              "step_outcome": os.environ["DIAGNOSTIC_OUTCOME"],
+              "tests": len(diagnostic_cases) if diagnostic_reports else None,
+              "cases": diagnostic_cases[:100],
+              "literal_controls_complete": controls_complete,
+              "source_summary_optimization_implemented": False,
+          }
+          (output / "diagnostic-report.json").write_text(
+              json.dumps(diagnostic_result, indent=2) + "\n", encoding="utf-8"
+          )
+          for phase in ("baseline", "diagnostic"):
+              log = Path(f"merge-pruning-{phase}-full.log")
+              if log.exists():
+                  with log.open(errors="replace") as stream:
+                      tail = deque((line[-1024:] for line in stream), maxlen=120)
+                  (output / f"{phase}-log-tail.txt").write_text(
+                      "".join(tail), encoding="utf-8"
+                  )
           print(json.dumps(result, indent=2))
+          print(json.dumps(diagnostic_result, indent=2))
           if sum(path.stat().st_size for path in output.iterdir()) > 2 * 1024**2:
               raise SystemExit("Diagnostic artifact exceeds the 2 MiB budget.")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
               stream.write("artifact_ready=true\n")
-          if not valid:
-              raise SystemExit("The intended nonzero baseline test result was not established.")
+          if not valid or not diagnostic_valid or not controls_complete:
+              raise SystemExit("Required baseline, diagnostics, or control results are missing.")
           PY
 
       - name: Upload small validation evidence
