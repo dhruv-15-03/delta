@@ -240,7 +240,7 @@ object MergeSourcePruningBenchmark {
     try {
       spark.sql(s"CREATE TABLE delta.`${target.getCanonicalPath}` SHALLOW CLONE " +
         s"delta.`${base.getCanonicalPath}` VERSION AS OF 0").collect()
-      val before = DeltaLog.forTable(spark, target).update()
+      val before = DeltaLog.forTable(spark, target.getCanonicalPath).update()
       require(manifest(target, before) == inputs, "The cloned input file manifest changed.")
       val expected = spark.read.format("delta").load(base.getCanonicalPath)
         .selectExpr("key", s"IF(${shape.membership}, 1L, 0L) value", "payload")
@@ -269,7 +269,7 @@ object MergeSourcePruningBenchmark {
         "Affected-row results differ from the expected synthetic update set.")
       require(stats.targetRowsUpdated == expectedUpdates)
       sameRows(spark.read.format("delta").load(target.getCanonicalPath), expected)
-      require(DeltaLog.forTable(spark, base).update().version == 0,
+      require(DeltaLog.forTable(spark, base.getCanonicalPath).update().version == 0,
         "The pinned source snapshot was modified.")
       Map(
         "arm" -> (if (bounded) "literal-bound-control" else "baseline"),
@@ -308,7 +308,7 @@ object MergeSourcePruningBenchmark {
 
   def measureControls(spark: SparkSession, directory: File, output: Path): Unit = {
     require(spark.sparkContext.master == "local[2]", "Use the planned local[2] resource bound.")
-    require(Runtime.getRuntime.maxMemory() <= 1100L * 1024 * 1024, "Test heap exceeds 1 GiB.")
+    require(Runtime.getRuntime.maxMemory() <= 1024L * 1024 * 1024, "Test heap exceeds 1 GiB.")
     Files.createDirectories(output)
     val destination = output.resolve("literal-controls.json")
     require(!Files.exists(destination), "Refusing to overwrite previous benchmark results.")
@@ -340,7 +340,7 @@ object MergeSourcePruningBenchmark {
         val targetData = if (layout == "clustered") generated else generated.repartition(numFiles)
         targetData.write.format("delta").option("compression", "snappy")
           .option("delta.enableDeletionVectors", "false").save(base.getCanonicalPath)
-        val snapshot = DeltaLog.forTable(spark, base).update()
+        val snapshot = DeltaLog.forTable(spark, base.getCanonicalPath).update()
         val inputs = manifest(base, snapshot)
         require(inputs.size <= 256 && inputs.values.sum <= 512L * 1024 * 1024)
         val contiguous = shapes.head
