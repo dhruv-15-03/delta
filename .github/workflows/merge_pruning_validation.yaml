@@ -21,7 +21,7 @@ jobs:
     if: >-
       github.repository == 'dhruv-15-03/delta' &&
       github.event.repository.private == false &&
-      github.run_number == 4 &&
+      github.run_number >= 5 && github.run_number <= 6 &&
       github.run_attempt == 1
     runs-on: ubuntu-24.04
     timeout-minutes: 60

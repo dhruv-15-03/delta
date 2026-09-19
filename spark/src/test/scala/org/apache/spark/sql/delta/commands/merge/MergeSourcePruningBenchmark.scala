@@ -542,6 +542,11 @@ private[merge] object MergeSourcePruningSmoke {
           case other => throw other
         }
       }
+
+      override def postVisitDirectory(
+          path: Path, error: java.io.IOException): FileVisitResult = {
+        if (error == null) FileVisitResult.CONTINUE else visitFileFailed(path, error)
+      }
     })
     bytes
   }
@@ -842,8 +847,12 @@ private[merge] object MergeSourcePruningSmoke {
       spark.range(64L, 64L + sourceRows, 1L, 2).selectExpr("id AS key", "1L AS value")
         .createOrReplaceTempView("pruning_smoke_source")
       val expected = beforeRows.toSeq.map { row =>
-        Row(row.getLong(0), if (row.getLong(0) >= 64L &&
-          row.getLong(0) < 64L + sourceRows) 1L else 0L, row.getString(2))
+        val value = if (row.getLong(0) >= 64L && row.getLong(0) < 64L + sourceRows) {
+          1L
+        } else {
+          0L
+        }
+        Row(row.getLong(0), value, row.getString(2))
       }
       Seq(false, true).foreach { bounded =>
         activeBudget.check()
