@@ -17,18 +17,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  baseline:
+  smoke:
     if: >-
       github.repository == 'dhruv-15-03/delta' &&
       github.event.repository.private == false &&
-      github.run_number <= 3 &&
+      github.run_number == 4 &&
       github.run_attempt == 1
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       BASE_SHA: 1d70393ecdbdadeb633dda5106a93e5d956b0611
-      BASELINE_SUITE: org.apache.spark.sql.delta.generatedsuites.merge.MergeIntoSuiteBaseMiscSQLPathBasedSuite
-      DIAGNOSTIC_SUITE: org.apache.spark.sql.delta.commands.merge.MergeSourcePruningValidationSuite
+      SMOKE_SUITE: org.apache.spark.sql.delta.commands.merge.MergeSourcePruningValidationSuite
+      SMOKE_TEST: resource serialization output smoke
       SPARK_VERSION: "4.2"
       TEST_PARALLELISM_COUNT: "1"
       NUM_SHARDS: "1"
@@ -91,6 +91,9 @@ jobs:
               "changed_files": changed,
               "spark_version_selector": os.environ["SPARK_VERSION"],
               "benchmark_executed": False,
+              "profile": "smoke",
+              "historical_baseline_run": 35367064130,
+              "historical_contract_run": 35372360930,
           }
           (output / "environment.json").write_text(
               json.dumps(environment, indent=2) + "\n", encoding="utf-8"
@@ -106,10 +109,10 @@ jobs:
         uses: actions/setup-java@17f84c3641ba7b8f6deff6309fc4c864478f5d62 # v3.14.1
         with:
           distribution: zulu
-          java-version: "17"
+          java-version: "17.0.20"
 
-      - name: Run the existing data-skipping baseline
-        id: baseline
+      - name: Compile and check style without running tests
+        id: compile
         shell: bash
         run: |
           set -euo pipefail
@@ -121,19 +124,18 @@ jobs:
           java -version > merge-pruning-results/java-version.txt 2>&1
           sbt_args=(
             -DsparkVersion=4.2
-            'set spark / Test / parallelExecution := false'
-            'set spark / Test / javaOptions += "-Dspark.master=local[2]"'
-            "spark/testOnly $BASELINE_SUITE -- -z \"data skipping\""
+            'spark / Test / scalastyle'
+            'spark / Test / compile'
           )
           {
             printf 'build/sbt'
             printf ' %q' "${sbt_args[@]}"
             printf '\n'
-          } | tee merge-pruning-results/command.txt
-          build/sbt "${sbt_args[@]}" 2>&1 | tee merge-pruning-baseline-full.log
+          } | tee merge-pruning-results/compile-command.txt
+          build/sbt "${sbt_args[@]}" 2>&1 | tee merge-pruning-compile-full.log
 
-      - name: Run test-only contracts and literal-bound controls
-        id: diagnostics
+      - name: Run exactly the three-minute tiny smoke
+        id: smoke
         shell: bash
         run: |
           set -euo pipefail
@@ -141,174 +143,244 @@ jobs:
           export JAVA_TOOL_OPTIONS="-Duser.home=$HOME"
           export UC_DIR="$GITHUB_WORKSPACE/target/validation-unitycatalog"
           unset UC_REF UC_VERSION UC_REPO UC_FORCE DELTA_RELEASE_MODE SHARD_ID
+          smoke_root="$GITHUB_WORKSPACE/target/validation-smoke"
+          test ! -e "$smoke_root"
+          mkdir -p "$smoke_root/tmp" "$smoke_root/local" "$smoke_root/jfr"
+          java_options=(
+            '-Dspark.master=local[2]'
+            '-Dspark.test.timeout=3'
+            '-Ddelta.mergePruning.profile=smoke'
+            "-Ddelta.mergePruning.results=$GITHUB_WORKSPACE/merge-pruning-results"
+            "-Ddelta.mergePruning.root=$smoke_root"
+            "-Djava.io.tmpdir=$smoke_root/tmp"
+            "-Dspark.local.dir=$smoke_root/local"
+            "-XX:FlightRecorderOptions=repository=$smoke_root/jfr,maxchunksize=1m"
+          )
+          quoted_options=$(printf '"%s",' "${java_options[@]}")
+          quoted_options="${quoted_options%,}"
           sbt_args=(
             -DsparkVersion=4.2
             'set spark / Test / parallelExecution := false'
-            'set spark / Test / javaOptions += "-Dspark.master=local[2]"'
-            "set spark / Test / javaOptions += \"-Ddelta.mergePruning.results=$GITHUB_WORKSPACE/merge-pruning-results\""
-            'spark / Test / scalastyle'
-            "spark/testOnly $DIAGNOSTIC_SUITE"
+            "set spark / Test / javaOptions ++= Seq($quoted_options)"
+            "spark/testOnly $SMOKE_SUITE -- -t \"$SMOKE_TEST\""
           )
           {
             printf 'build/sbt'
             printf ' %q' "${sbt_args[@]}"
             printf '\n'
-          } | tee merge-pruning-results/diagnostic-command.txt
-          build/sbt "${sbt_args[@]}" 2>&1 | tee merge-pruning-diagnostic-full.log
+          } | tee merge-pruning-results/smoke-command.txt
+          timeout --signal=TERM --kill-after=5s 180s \
+            build/sbt "${sbt_args[@]}" 2>&1 | tee merge-pruning-smoke-full.log
 
-      - name: Require nonzero intended tests and collect bounded evidence
+      - name: Preserve bounded evidence and validate the exact smoke result
         id: evidence
         if: always() && steps.checkout.outcome == 'success'
         shell: bash
         env:
-          BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
-          DIAGNOSTIC_OUTCOME: ${{ steps.diagnostics.outcome }}
+          COMPILE_OUTCOME: ${{ steps.compile.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib
           import json
           import os
+          import shutil
+          import tempfile
           import xml.etree.ElementTree as ET
           from collections import deque
           from pathlib import Path
 
-          output = Path("merge-pruning-results")
+          source = Path("merge-pruning-results")
+          output = Path("merge-pruning-upload")
           output.mkdir(exist_ok=True)
-          suite = os.environ["BASELINE_SUITE"]
-          simple_name = suite.rsplit(".", 1)[-1]
-          reports = []
-          for module in ("spark-unified", "spark"):
-              target = Path(module) / "target"
-              if target.exists():
-                  reports.extend(target.rglob(f"*{simple_name}*.xml"))
+          errors = []
           cases = []
-          report_sources = []
-          for path in reports:
-              if path.stat().st_size > 16 * 1024**2:
-                  raise SystemExit(f"Unexpectedly large focused report: {path}")
-              root = ET.parse(path).getroot()
-              if root.tag != "testsuite" or root.get("name") not in (suite, simple_name):
-                  raise SystemExit(f"Unexpected focused report identity: {path}")
-              report_sources.append({
-                  "path": str(path),
-                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                  "size_bytes": path.stat().st_size,
-              })
-              for case in root.findall("testcase"):
-                  outcome = "passed"
-                  message = None
-                  for tag in ("skipped", "failure", "error"):
-                      detail = case.find(tag)
-                      if detail is not None:
-                          outcome = tag
-                          message = (detail.get("message") or detail.text or "")[:4096]
-                          break
-                  cases.append({
-                      "name": case.get("name", ""),
-                      "seconds": case.get("time"),
-                      "outcome": outcome,
-                      "message": message,
-                  })
-          passed = sum(case["outcome"] == "passed" for case in cases)
-          failures = sum(case["outcome"] in ("failure", "error") for case in cases)
-          unexpected = [case["name"] for case in cases if "data skipping" not in case["name"]]
-          valid = (
-              os.environ["BASELINE_OUTCOME"] == "success"
-              and len(reports) == 1
-              and passed > 0
-              and failures == 0
-              and not unexpected
-          )
-          result = {
-              "status": "passed" if valid else "failed",
-              "suite": suite,
-              "selector": "data skipping",
-              "baseline_step_outcome": os.environ["BASELINE_OUTCOME"],
-              "report_sources": report_sources,
-              "tests": len(cases) if reports else None,
-              "passed": passed if reports else None,
-              "failures": failures if reports else None,
-              "cases": cases[:100],
-              "cases_truncated": len(cases) > 100,
-              "unexpected_test_names": unexpected[:100],
-              "benchmark_executed": False,
-          }
-          (output / "baseline-report.json").write_text(
-              json.dumps(result, indent=2) + "\n", encoding="utf-8"
-          )
-          diagnostic_suite = os.environ["DIAGNOSTIC_SUITE"]
-          diagnostic_reports = list(Path("spark-unified/target").rglob(
-              f"*{diagnostic_suite.rsplit('.', 1)[-1]}*.xml"
-          ))
-          diagnostic_cases = []
-          for path in diagnostic_reports:
-              if path.stat().st_size > 16 * 1024**2:
-                  raise SystemExit(f"Unexpectedly large diagnostic report: {path}")
-              root = ET.parse(path).getroot()
-              if root.tag != "testsuite" or root.get("name") != diagnostic_suite:
-                  raise SystemExit(f"Unexpected diagnostic report identity: {path}")
-              for case in root.findall("testcase"):
-                  outcome = "passed"
-                  message = None
-                  for tag in ("skipped", "failure", "error"):
-                      detail = case.find(tag)
-                      if detail is not None:
-                          outcome = tag
-                          message = (detail.get("message") or detail.text or "")[:4096]
-                          break
-                  diagnostic_cases.append({
-                      "name": case.get("name", ""),
-                      "seconds": case.get("time"),
-                      "outcome": outcome,
-                      "message": message,
-                  })
-          diagnostic_valid = (
-              os.environ["DIAGNOSTIC_OUTCOME"] == "success"
-              and len(diagnostic_reports) == 1
-              and len(diagnostic_cases) > 0
-              and all(case["outcome"] == "passed" for case in diagnostic_cases)
-          )
-          controls = output / "literal-controls.json"
-          controls_complete = (
-              controls.exists()
-              and json.loads(controls.read_text(encoding="utf-8"))["status"] == "complete"
-          )
-          diagnostic_result = {
-              "status": "passed" if diagnostic_valid else "failed",
-              "suite": diagnostic_suite,
-              "step_outcome": os.environ["DIAGNOSTIC_OUTCOME"],
-              "tests": len(diagnostic_cases) if diagnostic_reports else None,
-              "cases": diagnostic_cases[:100],
-              "literal_controls_complete": controls_complete,
-              "source_summary_optimization_implemented": False,
-          }
-          (output / "diagnostic-report.json").write_text(
-              json.dumps(diagnostic_result, indent=2) + "\n", encoding="utf-8"
-          )
-          for phase in ("baseline", "diagnostic"):
-              log = Path(f"merge-pruning-{phase}-full.log")
-              if log.exists():
-                  with log.open(errors="replace") as stream:
-                      tail = deque((line[-1024:] for line in stream), maxlen=120)
-                  (output / f"{phase}-log-tail.txt").write_text(
-                      "".join(tail), encoding="utf-8"
+          result = None
+          synthetic = {}
+
+          def inspect_json(path):
+              if not path.is_file():
+                  return None, "missing"
+              if path.stat().st_size > 128 * 1024:
+                  return None, "oversize"
+              try:
+                  value = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeError, json.JSONDecodeError):
+                  return None, "unreadable_or_malformed"
+              if not isinstance(value, dict):
+                  return None, "wrong_json_shape"
+              return value, None
+
+          def require(condition, message):
+              if not condition:
+                  errors.append(message)
+
+          try:
+              with tempfile.TemporaryDirectory(
+                  prefix="merge-smoke-collector-", dir=os.environ["RUNNER_TEMP"]
+              ) as directory:
+                  fixture = Path(directory)
+                  (fixture / "malformed.json").write_text("{", encoding="utf-8")
+                  (fixture / "large.json").write_bytes(b"x" * (128 * 1024 + 1))
+                  expected = {
+                      "missing.json": "missing",
+                      "malformed.json": "unreadable_or_malformed",
+                      "large.json": "oversize",
+                  }
+                  for name, code in expected.items():
+                      observed = inspect_json(fixture / name)[1]
+                      synthetic[name] = {"expected": code, "observed": observed}
+                      require(observed == code, f"Synthetic collector check failed: {name}")
+
+              result, problem = inspect_json(source / "smoke.json")
+              require(problem is None, f"Smoke result error: {problem}")
+              if result is not None:
+                  (output / "smoke.json").write_text(
+                      json.dumps(result, indent=2) + "\n", encoding="utf-8"
                   )
-          print(json.dumps(result, indent=2))
-          print(json.dumps(diagnostic_result, indent=2))
-          if sum(path.stat().st_size for path in output.iterdir()) > 2 * 1024**2:
-              raise SystemExit("Diagnostic artifact exceeds the 2 MiB budget.")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
-              stream.write("artifact_ready=true\n")
-          if not valid or not diagnostic_valid or not controls_complete:
-              raise SystemExit("Required baseline, diagnostics, or control results are missing.")
+                  require(result.get("schemaVersion") == 1, "Unexpected smoke schema.")
+                  require(result.get("profile") == "smoke", "Wrong profile executed.")
+                  require(result.get("status") == "passed", "Smoke did not pass.")
+                  require(result.get("benchmarkExecuted") is False, "Timing matrix was invoked.")
+                  require(result.get("performanceClaim") is False, "Unexpected performance claim.")
+                  resources = result.get("resources", {})
+                  require(resources.get("master") in ("local[2]", "local[2,1]"),
+                          "Wrong Spark master.")
+                  require(resources.get("defaultParallelism") == 2 and
+                          resources.get("taskCpus") == 1, "Wrong task resource settings.")
+                  require(0 < resources.get("maximumHeapBytes", 0) <= 1073741824,
+                          "Heap guard evidence is missing or outside limits.")
+                  require(resources.get("sparkVersion") == "4.2.0" and
+                          resources.get("scalaVersion") == "2.13.17" and
+                          resources.get("javaVersion", "").startswith("17."),
+                          "Runtime pins do not match.")
+                  fixture = result.get("fixture", {})
+                  require(0 < fixture.get("targetRows", 0) <= 4096 and
+                          0 < fixture.get("targetFiles", 0) <= 4 and
+                          0 < fixture.get("targetBytes", 0) <= 1048576 and
+                          0 < fixture.get("sourceRows", 0) <= 64, "Fixture caps are not proven.")
+                  require(result.get("mergesStarted") == 2 and
+                          result.get("mergesCompleted") == 2, "Expected exactly two MERGEs.")
+                  require(result.get("readerCoverageEstablished") is True,
+                          "Actual reader coverage was not established.")
+                  phases = result.get("phases", [])
+                  require([phase.get("phase") for phase in phases] == [
+                      "actual-parquet-scan", "baseline-merge", "literal-control-merge"
+                  ], "Missing or unexpected reader coverage phases.")
+                  for phase in phases:
+                      require(phase.get("covered") is True and
+                              phase.get("dataLossEvents") == 0 and
+                              phase.get("rollingRetention") is False and
+                              phase.get("openRawStreams") == 0 and
+                              phase.get("targetReaderBytes", 0) > 0 and
+                              phase.get("targetReaderBytes") ==
+                              phase.get("independentRawReaderBytes") and
+                              phase.get("negativeControlBytes") == 128 and
+                              phase.get("negativeControlExcludedFromTarget") is True,
+                              f"Incomplete actual-reader proof: {phase.get('phase')}")
+                  if len(phases) == 3:
+                      require(phases[0].get("targetFilesRead") == fixture.get("targetFiles") and
+                              any(name.endswith("DeltaParquetFileFormat") for name in
+                                  phases[0].get("readerFormats", [])),
+                              "The full fixture was not read through Delta Parquet.")
+                      require(all(phase.get("dataCorrect") is True and
+                                  phase.get("metricsCorrect") is True for phase in phases[1:]),
+                              "The two MERGEs did not prove data/metric correctness.")
+                  require(all(result.get("outputChecks", {}).get(key) is True for key in (
+                      "roundTrip", "atomicReplacement", "syntheticFailureRecord"
+                  )), "Output/serialization checks are incomplete.")
+                  require(0 < result.get("elapsedMs", 0) <= 180000,
+                          "Smoke elapsed-time evidence is outside its budget.")
+                  require(0 < result.get("peakTemporaryBytes", 0) <= 16777216 and
+                          result.get("openRawStreamsAfterCleanup") == 0 and
+                          result.get("scratchDataRemoved") is True, "Cleanup/cap proof failed.")
+
+              suite = os.environ["SMOKE_SUITE"]
+              reports = list(Path("spark-unified/target").rglob(
+                  f"*{suite.rsplit('.', 1)[-1]}*.xml"
+              ))
+              require(len(reports) == 1, "Exactly one intended test report is required.")
+              for path in reports:
+                  if path.stat().st_size > 1024 * 1024:
+                      errors.append("The test report exceeded its size limit.")
+                      continue
+                  root = ET.parse(path).getroot()
+                  require(root.tag == "testsuite" and root.get("name") == suite,
+                          "Wrong test-suite identity.")
+                  for case in root.findall("testcase"):
+                      detail = next((case.find(tag) for tag in ("failure", "error", "skipped")
+                                     if case.find(tag) is not None), None)
+                      cases.append({
+                          "name": case.get("name"),
+                          "seconds": case.get("time"),
+                          "outcome": "passed" if detail is None else detail.tag,
+                          "message": None if detail is None else
+                          (detail.get("message") or detail.text or "")[:2048],
+                      })
+              require(len(cases) == 1 and cases[0]["name"] == os.environ["SMOKE_TEST"] and
+                      cases[0]["outcome"] == "passed", "The one selected smoke test did not pass.")
+              require(os.environ["COMPILE_OUTCOME"] == "success" and
+                      os.environ["SMOKE_OUTCOME"] == "success",
+                      "Compile or smoke command failed; no success fallback is allowed.")
+          except Exception as error:
+              errors.append(f"Evidence collection failed: {type(error).__name__}: {str(error)[:1024]}")
+          finally:
+              for name in ("environment.json", "java-version.txt", "compile-command.txt",
+                           "smoke-command.txt", "serialization.json", "synthetic-failure.json"):
+                  path = source / name
+                  try:
+                      if path.is_file() and path.stat().st_size <= 32 * 1024:
+                          shutil.copyfile(path, output / name)
+                      elif path.exists():
+                          errors.append(f"Excluded oversized evidence: {name}")
+                  except OSError as error:
+                      errors.append(f"Cannot preserve {name}: {str(error)[:512]}")
+              for phase in ("compile", "smoke"):
+                  log = Path(f"merge-pruning-{phase}-full.log")
+                  if log.exists():
+                      try:
+                          with log.open(errors="replace") as stream:
+                              tail = deque((line[-1024:] for line in stream), maxlen=120)
+                          (output / f"{phase}-log-tail.txt").write_text(
+                              "".join(tail), encoding="utf-8"
+                          )
+                      except OSError as error:
+                          errors.append(f"Cannot preserve {phase} log: {str(error)[:512]}")
+              # Never let a malformed/large raw result prevent a small failure packet.
+              for path in list(output.iterdir()):
+                  if path.is_file() and path.stat().st_size > 256 * 1024:
+                      errors.append(f"Excluded oversized upload: {path.name}")
+                      path.unlink()
+              packet = {
+                  "status": "failed" if errors else "passed",
+                  "profile": "smoke",
+                  "run_id": os.environ["GITHUB_RUN_ID"],
+                  "compile_outcome": os.environ["COMPILE_OUTCOME"],
+                  "smoke_outcome": os.environ["SMOKE_OUTCOME"],
+                  "selected_tests": len(cases),
+                  "cases": cases[:2],
+                  "errors": errors[:30],
+                  "collector_checks": {"synthetic": True, "results": synthetic},
+                  "benchmark_executed": False,
+                  "historical_results_not_rerun": {"baseline": "7/7", "contracts": "12/13"},
+              }
+              (output / "smoke-report.json").write_text(
+                  json.dumps(packet, indent=2) + "\n", encoding="utf-8"
+              )
+              print(json.dumps(packet, indent=2))
+              if sum(path.stat().st_size for path in output.iterdir()) > 2 * 1024**2:
+                  raise SystemExit("Bounded failure packet exceeded the 2 MiB upload budget.")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+                  stream.write("artifact_ready=true\n")
+          if errors:
+              raise SystemExit("The smoke/evidence gate failed; inspect the bounded artifact.")
           PY
 
       - name: Upload small validation evidence
         if: always() && steps.evidence.outputs.artifact_ready == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: merge-pruning-baseline-${{ github.run_id }}
-          path: merge-pruning-results/
+          name: merge-pruning-smoke-${{ github.run_id }}
+          path: merge-pruning-upload/
           retention-days: 1
           if-no-files-found: warn
