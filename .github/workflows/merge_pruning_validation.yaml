@@ -21,7 +21,7 @@ jobs:
     if: >-
       github.repository == 'dhruv-15-03/delta' &&
       github.event.repository.private == false &&
-      github.run_number >= 5 && github.run_number <= 6 &&
+      github.run_number == 7 &&
       github.run_attempt == 1
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -188,6 +188,7 @@ jobs:
           import tempfile
           import xml.etree.ElementTree as ET
           from collections import deque
+          from datetime import datetime
           from pathlib import Path
 
           source = Path("merge-pruning-results")
@@ -197,6 +198,10 @@ jobs:
           cases = []
           result = None
           synthetic = {}
+          reader_packets = {}
+          reader_names = [
+              "actual-parquet-scan", "baseline-merge", "literal-control-merge"
+          ]
 
           def inspect_json(path):
               if not path.is_file():
@@ -215,6 +220,113 @@ jobs:
               if not condition:
                   errors.append(message)
 
+          def check_reader_packet(phase, packet):
+              prefix = f"Reader packet {phase}: "
+              require(packet.get("schemaVersion") == 1 and packet.get("phase") == phase and
+                      packet.get("evidenceFile") == f"reader-{phase}.json",
+                      prefix + "wrong identity/schema.")
+              require(packet.get("diagnosticCaptureComplete") is True and
+                      packet.get("operationReturned") is True,
+                      prefix + "capture or operation did not complete.")
+              require(packet.get("covered") is True and
+                      packet.get("targetCoverageStatus") == "verified" and
+                      packet.get("problems") == [] and packet.get("independentProblems") == [],
+                      prefix + "target attribution remains incomplete.")
+              require(packet.get("rawRecordingRetained") is False and
+                      isinstance(packet.get("rawRecordingOmissionReason"), str) and
+                      bool(packet["rawRecordingOmissionReason"]),
+                      prefix + "raw-recording disposition is not explicit.")
+              witnesses = packet.get("pathlessReadWitnesses", [])
+              require(packet.get("witnessLimit") == 8 and packet.get("stackFrameLimit") == 12 and
+                      len(witnesses) <= 8 and packet.get("witnessesOmitted") == 0,
+                      prefix + "witness budget/completeness failed.")
+              require(packet.get("pathlessReadEvents") == len(witnesses) ==
+                      packet.get("nullPathEvents", 0) + packet.get("emptyPathEvents", 0) and
+                      packet.get("pathlessReadBytes") == sum(w["bytesRead"] for w in witnesses),
+                      prefix + "unattributed aggregates do not match retained events.")
+              for witness in witnesses:
+                  require(witness.get("eventType") == "jdk.FileRead" and
+                          witness.get("pathState") in ("null", "empty") and
+                          isinstance(witness.get("bytesRead"), int) and witness["bytesRead"] >= 0 and
+                          isinstance(witness.get("stackAvailable"), bool) and
+                          isinstance(witness.get("stackTruncated"), bool) and
+                          0 <= len(witness.get("stackFrames", [])) <= 12 and
+                          witness.get("stackFramesOmitted", -1) >= 0 and
+                          witness.get("eventSizeAvailable") is False,
+                          prefix + "incomplete event witness.")
+                  datetime.fromisoformat(witness["startTime"].replace("Z", "+00:00"))
+                  datetime.fromisoformat(witness["endTime"].replace("Z", "+00:00"))
+              known = [w for w in witnesses if
+                       w.get("attribution") == "known-non-target-descriptor-control"]
+              spans = packet.get("descriptorControlSpans", [])
+              require(len(known) == len(spans) == packet.get("knownDescriptorControlEvents") == 1,
+                      prefix + "descriptor control was not uniquely identified.")
+              if len(known) == len(spans) == 1:
+                  witness, span = known[0], spans[0]
+                  start = datetime.fromisoformat(span["startTime"].replace("Z", "+00:00"))
+                  end = datetime.fromisoformat(span["endTime"].replace("Z", "+00:00"))
+                  read_start = datetime.fromisoformat(witness["startTime"].replace("Z", "+00:00"))
+                  read_end = datetime.fromisoformat(witness["endTime"].replace("Z", "+00:00"))
+                  require(witness["pathState"] == "null" and
+                          witness["bytesRead"] == span["bytesRead"] == 64 and
+                          isinstance(witness.get("threadId"), int) and
+                          witness["threadId"] == span.get("threadId") and
+                          start <= read_start <= read_end <= end and
+                          witness["stackAvailable"] is True and any(frame.startswith(
+                              "org.apache.spark.sql.delta.commands.merge."
+                              "MergeSmokeAttribution$#readDescriptorControl:"
+                          ) for frame in witness["stackFrames"]),
+                          prefix + "descriptor classification lacks span/thread/stack evidence.")
+              require(packet.get("knownDescriptorControlBytes") == 64 and
+                      packet.get("unattributedReadEvents") == 0 and
+                      packet.get("unattributedReadBytes") == 0,
+                      prefix + "unknown global reads have not been attributed.")
+              per_file = packet.get("perFileBytes", [])
+              streams = packet.get("targetStreamWitnesses", [])
+              raw_vectors = packet.get("completedRawVectors", [])
+              vector_events = packet.get("recordedVectorEvents", [])
+              require(0 < len(per_file) <= 4 and
+                      sorted(f["fileIndex"] for f in per_file) == list(range(len(per_file))),
+                      prefix + "target-file witness domain is not unique.")
+              require(0 < len(streams) <= 128 and
+                      len({s["streamId"] for s in streams}) == len(streams) and all(
+                          s.get("implementation") == "org.apache.hadoop.fs.BufferedFSInputStream" and
+                          s.get("initialBytes") == 0 and s.get("closed") is True and
+                          s.get("fileIndex") in range(len(per_file)) and
+                          s.get("finalSynchronousBytes", -1) >= 0
+                          for s in streams
+                      ), prefix + "raw-stream domain was not covered from open through close.")
+              require(len(raw_vectors) <= 1024 and len(vector_events) <= 1024 and
+                      len({v["rangeId"] for v in raw_vectors}) == len(raw_vectors) and
+                      len({v["rangeId"] for v in vector_events}) == len(vector_events) and
+                      sorted(raw_vectors, key=lambda v: v["rangeId"]) ==
+                      sorted(vector_events, key=lambda v: v["rangeId"]) and
+                      packet.get("completedVectorRanges") == len(vector_events) and
+                      packet.get("pendingFailedOrCancelledVectorIds") == [] and all(
+                          v.get("fileIndex") in range(len(per_file)) and
+                          isinstance(v.get("bytesRead"), int) and v["bytesRead"] >= 0
+                          for v in raw_vectors + vector_events
+                      ), prefix + "completed raw buffers and unique vector events differ.")
+              for file in per_file:
+                  index = file["fileIndex"]
+                  require(file["hadoopSynchronousBytes"] == sum(
+                              s["finalSynchronousBytes"] for s in streams if s["fileIndex"] == index
+                          ) and file["streamWitnesses"] ==
+                          sum(s["fileIndex"] == index for s in streams) and
+                          file["completedRawVectorBytes"] == sum(
+                              v["bytesRead"] for v in raw_vectors if v["fileIndex"] == index
+                          ) and file["vectorCompletionEventBytes"] == sum(
+                              v["bytesRead"] for v in vector_events if v["fileIndex"] == index
+                          ) and file["jdkFileReadBytes"] == file["hadoopSynchronousBytes"] and
+                          file["vectorCompletionEventBytes"] == file["completedRawVectorBytes"],
+                          prefix + f"file {index} native/raw component proof failed.")
+              require(packet.get("dataLossEvents") == 0 and
+                      packet.get("rollingRetention") is False and
+                      packet.get("openRawStreams") == 0 and
+                      packet.get("pendingVectorRanges") == 0 and
+                      packet.get("overlappedSynchronousAccounting") is False,
+                      prefix + "loss, retention, lifecycle or overlap guards failed.")
+
           try:
               with tempfile.TemporaryDirectory(
                   prefix="merge-smoke-collector-", dir=os.environ["RUNNER_TEMP"]
@@ -231,6 +343,23 @@ jobs:
                       observed = inspect_json(fixture / name)[1]
                       synthetic[name] = {"expected": code, "observed": observed}
                       require(observed == code, f"Synthetic collector check failed: {name}")
+
+              # Copy every bounded diagnostic before evaluating any success condition.
+              for phase in reader_names:
+                  path = source / f"reader-{phase}.json"
+                  if path.exists():
+                      packet, problem = inspect_json(path)
+                      require(problem is None, f"Reader evidence {phase}: {problem}")
+                      if packet is not None:
+                          reader_packets[phase] = packet
+                          (output / path.name).write_text(
+                              json.dumps(packet, indent=2) + "\n", encoding="utf-8"
+                          )
+              for phase, packet in reader_packets.items():
+                  try:
+                      check_reader_packet(phase, packet)
+                  except (KeyError, TypeError, ValueError, OverflowError) as error:
+                      errors.append(f"Malformed reader evidence {phase}: {type(error).__name__}")
 
               result, problem = inspect_json(source / "smoke.json")
               require(problem is None, f"Smoke result error: {problem}")
@@ -252,8 +381,15 @@ jobs:
                           "Heap guard evidence is missing or outside limits.")
                   require(resources.get("sparkVersion") == "4.2.0" and
                           resources.get("scalaVersion") == "2.13.17" and
+                          resources.get("hadoopVersion") == "3.5.0" and
                           resources.get("javaVersion", "").startswith("17."),
                           "Runtime pins do not match.")
+                  require(all(resources.get("sqlSettings", {}).get(key) == "true" for key in (
+                      "spark.sql.adaptive.enabled",
+                      "spark.sql.optimizer.dynamicPartitionPruning.enabled",
+                      "spark.sql.optimizer.runtime.bloomFilter.enabled",
+                      "spark.sql.parquet.enableVectorizedReader",
+                  )), "Baseline AQE/DPP/Bloom/vectorized-reader settings changed.")
                   fixture = result.get("fixture", {})
                   require(0 < fixture.get("targetRows", 0) <= 4096 and
                           0 < fixture.get("targetFiles", 0) <= 4 and
@@ -263,11 +399,34 @@ jobs:
                           result.get("mergesCompleted") == 2, "Expected exactly two MERGEs.")
                   require(result.get("readerCoverageEstablished") is True,
                           "Actual reader coverage was not established.")
+                  require(result.get("diagnosticCaptureComplete") is True and
+                          result.get("targetCoverageStatus") == "verified-for-captured-phases" and
+                          result.get("mergeCorrectnessStatus") == "verified" and
+                          set(reader_packets) == set(reader_names),
+                          "Capture, coverage and MERGE correctness were not separately verified.")
+                  controls = result.get("attributionControlChecks", {})
+                  require(controls.get("synthetic") is True and
+                          controls.get("hadoopCountersSynthetic") is False and
+                          controls.get("pathlessEventsPreservedInBothMutations", 0) > 0 and all(
+                              controls.get(key) is True for key in (
+                                  "missingTargetSyncEventRejected", "missingVectorEventRejected",
+                                  "nativeDescriptorControlObserved", "emptyPathRejected",
+                                  "unattributedNullPathRejected", "dataLossRejected",
+                                  "streamEscapeRejected"
+                              )
+                          ), "Exact parser/attribution negative controls did not pass.")
                   phases = result.get("phases", [])
                   require([phase.get("phase") for phase in phases] == [
                       "actual-parquet-scan", "baseline-merge", "literal-control-merge"
                   ], "Missing or unexpected reader coverage phases.")
                   for phase in phases:
+                      packet = reader_packets.get(phase.get("phase"), {})
+                      require(phase.get("perFileBytes") == packet.get("perFileBytes") and
+                              phase.get("targetReaderBytes") == packet.get("targetReaderBytes") and
+                              phase.get("diagnosticCaptureComplete") is True and
+                              phase.get("targetCoverageStatus") == "verified" and
+                              phase.get("operationReturned") is True,
+                              "Phase summary does not match its persisted diagnostic proof.")
                       require(phase.get("covered") is True and
                               phase.get("dataLossEvents") == 0 and
                               phase.get("rollingRetention") is False and
@@ -303,12 +462,21 @@ jobs:
                           phase.get("targetReaderBytes"),
                           f"Per-file synchronous/vectored witness mismatch: {phase.get('phase')}")
                   if len(phases) == 3:
+                      negative = phases[0].get("negativeControlChecks", {})
+                      require(negative.get("syntheticNegativeChecks") is True and
+                              negative.get("mutationOfObservedEvents") is True and
+                              negative.get("missingTargetSyncEventRejected") is True and
+                              negative.get("missingVectorEventRejected") is True and
+                              negative.get("pathlessEventsPreservedInBothMutations", 0) > 0,
+                              "Missing target events were not rejected with descriptor I/O present.")
                       require(phases[0].get("targetFilesRead") == fixture.get("targetFiles") and
                               any(name.endswith("DeltaParquetFileFormat") for name in
                                   phases[0].get("readerFormats", [])),
                               "The full fixture was not read through Delta Parquet.")
                       require(all(phase.get("dataCorrect") is True and
-                                  phase.get("metricsCorrect") is True for phase in phases[1:]),
+                                  phase.get("metricsCorrect") is True and
+                                  phase.get("commitCorrect") is True and
+                                  phase.get("commitVersion") == 1 for phase in phases[1:]),
                               "The two MERGEs did not prove data/metric correctness.")
                   require(all(result.get("outputChecks", {}).get(key) is True for key in (
                       "roundTrip", "atomicReplacement", "syntheticFailureRecord"
@@ -384,6 +552,17 @@ jobs:
                   "selected_tests": len(cases),
                   "cases": cases[:2],
                   "errors": errors[:30],
+                  "reader_diagnostics": [
+                      {
+                          "phase": phase,
+                          "diagnostic_capture_complete": value.get("diagnosticCaptureComplete"),
+                          "target_coverage_status": value.get("targetCoverageStatus"),
+                          "operation_returned": value.get("operationReturned"),
+                          "unattributed_read_events": value.get("unattributedReadEvents"),
+                          "raw_recording_retained": value.get("rawRecordingRetained"),
+                      }
+                      for phase, value in reader_packets.items()
+                  ],
                   "collector_checks": {"synthetic": True, "results": synthetic},
                   "benchmark_executed": False,
                   "historical_results_not_rerun": {"baseline": "7/7", "contracts": "12/13"},
