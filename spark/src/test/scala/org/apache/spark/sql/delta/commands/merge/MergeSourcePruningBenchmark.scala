@@ -24,7 +24,7 @@ import java.nio.file.{FileVisitResult, Files, NoSuchFileException, Path, SimpleF
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.time.Duration
-import java.util.concurrent.{Executors, TimeUnit}
+import java.util.concurrent.{CompletableFuture, Executors, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import java.util.function.{Consumer, IntFunction}
 
@@ -33,7 +33,7 @@ import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import com.databricks.spark.util.Log4jUsageLogger
-import jdk.jfr.{FlightRecorder, Recording, RecordingState}
+import jdk.jfr.{AnnotationElement, EventFactory, FlightRecorder, Name, Recording, RecordingState, ValueDescriptor}
 import jdk.jfr.consumer.RecordingFile
 import org.apache.spark.sql.delta.{DeltaLog, Snapshot}
 import org.apache.spark.sql.delta.util.JsonUtils
@@ -438,16 +438,14 @@ class MergeSmokeRawFileSystem extends RawLocalFileSystem {
       override def readVectored(
           ranges: java.util.List[_ <: FileRange],
           allocate: IntFunction[ByteBuffer]): Unit = {
-        MergeSmokeReads.uncovered(id, "asynchronous vectored reads")
-        super.readVectored(ranges, allocate)
+        super.readVectored(MergeSmokeReads.observeVectors(id, ranges), allocate)
       }
 
       override def readVectored(
           ranges: java.util.List[_ <: FileRange],
           allocate: IntFunction[ByteBuffer],
           release: Consumer[ByteBuffer]): Unit = {
-        MergeSmokeReads.uncovered(id, "asynchronous vectored reads")
-        super.readVectored(ranges, allocate, release)
+        super.readVectored(MergeSmokeReads.observeVectors(id, ranges), allocate, release)
       }
 
       override def close(): Unit = {
@@ -461,9 +459,30 @@ class MergeSmokeRawFileSystem extends RawLocalFileSystem {
 
 private[merge] object MergeSmokeReads {
   private case class Witness(path: String, statistics: IOStatistics)
+  private case class VectorRead(
+      streamId: Long,
+      path: String,
+      length: Int,
+      synchronousBytesBefore: Long,
+      var completedBytes: Option[Long] = None)
+  case class Counts(
+      synchronous: Map[String, Long],
+      vectored: Map[String, Long],
+      vectorIds: Set[Long])
+
+  val vectorEventName: String = "delta.smoke.CompletedVectorRead"
+  // Hadoop's asynchronous channel path has neither jdk.FileRead events nor stream_read_bytes.
+  // Record only successful raw-range completions; keep the two components separate.
+  private lazy val vectorEvents = EventFactory.create(
+    Seq(new AnnotationElement(classOf[Name], vectorEventName)).asJava,
+    Seq(new ValueDescriptor(classOf[String], "path"),
+      new ValueDescriptor(java.lang.Long.TYPE, "rangeId"),
+      new ValueDescriptor(java.lang.Long.TYPE, "bytesRead")).asJava)
   private var nextId = 0L
+  private var nextVectorId = 0L
   private val open = mutable.Set.empty[Long]
   private val witnesses = mutable.Map.empty[Long, Witness]
+  private val vectors = mutable.Map.empty[Long, VectorRead]
   private val uncoveredApis = mutable.Set.empty[String]
   private var watched = Set.empty[String]
 
@@ -489,15 +508,76 @@ private[merge] object MergeSmokeReads {
     if (witnesses.contains(id)) uncoveredApis += api
   }
 
+  def enableVectorEvents(recording: Recording): Unit = {
+    recording.enable(vectorEvents.getEventType.getName)
+      .withThreshold(Duration.ZERO).withoutStackTrace()
+  }
+
+  def observeVectors(
+      streamId: Long,
+      ranges: java.util.List[_ <: FileRange]): java.util.List[_ <: FileRange] = synchronized {
+    witnesses.get(streamId) match {
+      case None => ranges
+      case Some(witness) =>
+        require(ranges.size() <= 1024 - vectors.size, "Vectored-read witness budget exceeded.")
+        ranges.asScala.map { range =>
+          require(range.getOffset >= 0 && range.getLength >= 0, "Invalid raw read range.")
+          nextVectorId += 1
+          val vectorId = nextVectorId
+          vectors(vectorId) = VectorRead(streamId, witness.path, range.getLength,
+            witness.statistics.counters().get("stream_read_bytes").longValue())
+          new FileRange {
+            private var nativeFuture: CompletableFuture[ByteBuffer] = null
+
+            override def getOffset: Long = range.getOffset
+            override def getLength: Int = range.getLength
+            override def getReference: AnyRef = range.getReference
+            override def getData: CompletableFuture[ByteBuffer] = nativeFuture
+
+            override def setData(data: CompletableFuture[ByteBuffer]): Unit = {
+              require(data != null && nativeFuture == null, "Read future assigned more than once.")
+              nativeFuture = data
+              // The backend completes its own future. Its caller sees the same buffer only
+              // after accounting, before consumer code can advance the buffer's position.
+              range.setData(data.thenApply[ByteBuffer] { (buffer: ByteBuffer) =>
+                completeVector(vectorId, buffer)
+                buffer
+              })
+            }
+          }: FileRange
+        }.asJava
+    }
+  }
+
+  private def completeVector(id: Long, buffer: ByteBuffer): Unit = synchronized {
+    val read = vectors.getOrElse(id,
+      throw new IllegalStateException("A vector read completed outside its capture."))
+    require(buffer != null && buffer.position() == 0 && buffer.remaining() == read.length,
+      "The raw vectored read did not complete with the full requested range.")
+    require(read.completedBytes.isEmpty, "A vector range completed more than once.")
+    require(witnesses(read.streamId).statistics.counters().get("stream_read_bytes").longValue() ==
+      read.synchronousBytesBefore,
+      "Vectored reads overlapped synchronous accounting; adding both would double-count.")
+    val actualBytes = buffer.remaining().toLong
+    val event = vectorEvents.newEvent()
+    require(event.shouldCommit(), "The completed-vector JFR event is not being recorded.")
+    event.set(0, read.path)
+    event.set(1, java.lang.Long.valueOf(id))
+    event.set(2, java.lang.Long.valueOf(actualBytes))
+    event.commit()
+    read.completedBytes = Some(actualBytes)
+  }
+
   def begin(paths: Set[String]): Unit = synchronized {
     require(watched.isEmpty && open.isEmpty, "Reader capture starts with live streams.")
     require(paths.nonEmpty && paths.size <= 4, "Unexpected target file count.")
     watched = paths
     witnesses.clear()
+    vectors.clear()
     uncoveredApis.clear()
   }
 
-  def finish(): Map[String, Long] = synchronized {
+  def finish(): Counts = synchronized {
     require(open.isEmpty, "Reader capture ended with unclosed raw streams.")
     require(uncoveredApis.isEmpty, s"Unaccounted reader APIs: $uncoveredApis")
     val values = witnesses.values.toSeq.map { witness =>
@@ -505,12 +585,21 @@ private[merge] object MergeSmokeReads {
       require(count >= 0, "Negative raw-reader byte count.")
       witness.path -> count
     }
-    values.groupMapReduce(_._1)(_._2)((left, right) => Math.addExact(left, right))
+    val completed = vectors.values.toSeq.map { read =>
+      read.path -> read.completedBytes.getOrElse {
+        throw new IllegalStateException("A raw vector read is pending, failed or cancelled.")
+      }
+    }
+    def total(reads: Seq[(String, Long)]): Map[String, Long] =
+      reads.groupMapReduce(_._1)(_._2)((left, right) => Math.addExact(left, right))
+        .filter(_._2 != 0L)
+    Counts(total(values), total(completed), vectors.keySet.toSet)
   }
 
   def resetCapture(): Unit = synchronized {
     watched = Set.empty
     witnesses.clear()
+    vectors.clear()
     uncoveredApis.clear()
   }
 
@@ -645,6 +734,7 @@ private[merge] object MergeSourcePruningSmoke {
     Utils.tryWithSafeFinally {
       recorder.enable("jdk.FileRead").withThreshold(Duration.ZERO).withoutStackTrace()
       recorder.enable("jdk.DataLoss")
+      MergeSmokeReads.enableVectorEvents(recorder)
       recorder.setMaxSize(0L) // A rolling limit could silently discard the first target reads.
       require(recorder.getMaxAge == null, "JFR must not discard events by age.")
       MergeSmokeReads.begin(paths)
@@ -660,12 +750,14 @@ private[merge] object MergeSourcePruningSmoke {
       require(recorder.getState == RecordingState.RUNNING, "Recording stopped prematurely.")
       recorder.stop()
       val independent = MergeSmokeReads.finish()
-      require(independent.nonEmpty && independent.values.forall(_ > 0),
+      require(independent.synchronous.nonEmpty || independent.vectored.nonEmpty,
         "The actual Parquet reader did not provide positive target-byte counters.")
       recorder.dump(destination)
       require(Files.size(destination) <= maxRecordingBytes, "JFR dump budget exceeded.")
       budget.check()
-      val totals = mutable.Map.empty[String, Long].withDefaultValue(0L)
+      val synchronous = mutable.Map.empty[String, Long].withDefaultValue(0L)
+      val vectored = mutable.Map.empty[String, Long].withDefaultValue(0L)
+      val vectorIds = mutable.Set.empty[Long]
       var markerBytes = 0L
       var eventCount = 0
       val input = new RecordingFile(destination)
@@ -683,10 +775,16 @@ private[merge] object MergeSourcePruningSmoke {
             val count = event.getLong("bytesRead")
             require(count >= 0, "Negative JFR byte count.")
             if (paths.contains(path)) {
-              totals(path) = Math.addExact(totals(path), count)
+              synchronous(path) = Math.addExact(synchronous(path), count)
             } else if (path == marker.toFile.getCanonicalPath) {
               markerBytes = Math.addExact(markerBytes, count)
             }
+          } else if (event.getEventType.getName == MergeSmokeReads.vectorEventName) {
+            val path = new File(event.getString("path")).getCanonicalPath
+            val count = event.getLong("bytesRead")
+            require(paths.contains(path) && count >= 0, "Unexpected vectored-read event.")
+            require(vectorIds.add(event.getLong("rangeId")), "Duplicate vector completion event.")
+            vectored(path) = Math.addExact(vectored(path), count)
           }
         }
       } {
@@ -694,16 +792,31 @@ private[merge] object MergeSourcePruningSmoke {
       }
       require(markerBytes == 128L, "The unrelated-file JFR negative control was not observed.")
       val perFile = paths.toSeq.sorted.zipWithIndex.map { case (path, index) =>
-        Map("fileIndex" -> index, "jfrBytes" -> totals.get(path),
-          "independentBytes" -> independent.get(path))
+        Map("fileIndex" -> index, "jdkFileReadBytes" -> synchronous(path),
+          "hadoopSynchronousBytes" -> independent.synchronous.getOrElse(path, 0L),
+          "vectorCompletionEventBytes" -> vectored(path),
+          "completedRawVectorBytes" -> independent.vectored.getOrElse(path, 0L))
       }
-      require(totals.toMap == independent,
+      require(synchronous.toMap.filter(_._2 != 0L) == independent.synchronous &&
+        vectored.toMap.filter(_._2 != 0L) == independent.vectored &&
+        vectorIds.toSet == independent.vectorIds,
         s"JFR/raw-reader counters disagree; coverage is not established: $perFile")
+      val totals = paths.map { path =>
+        path -> Math.addExact(synchronous(path), vectored(path))
+      }.toMap.filter(_._2 > 0L)
       result -> Map(
         "phase" -> label, "covered" -> true, "dataLossEvents" -> 0,
         "rollingRetention" -> false, "openRawStreams" -> MergeSmokeReads.openCount,
         "targetFilesRead" -> totals.size, "targetReaderBytes" -> totals.values.sum,
-        "independentRawReaderBytes" -> independent.values.sum,
+        "independentRawReaderBytes" ->
+          Math.addExact(independent.synchronous.values.sum, independent.vectored.values.sum),
+        "jdkFileReadBytes" -> synchronous.values.sum,
+        "vectorCompletionEventBytes" -> vectored.values.sum,
+        "completedVectorRanges" -> vectorIds.size,
+        "vectorCompletionIdsVerified" -> true, "pendingVectorRanges" -> 0,
+        "overlappedSynchronousAccounting" -> false,
+        "vectorAccounting" -> "Successful raw FileRange buffers, not submitted/logical ranges",
+        "vectorEventType" -> MergeSmokeReads.vectorEventName,
         "perFileBytes" -> perFile,
         "negativeControlBytes" -> markerBytes,
         "negativeControlExcludedFromTarget" -> true, "recordingBytes" -> Files.size(destination),
@@ -766,6 +879,7 @@ private[merge] object MergeSourcePruningSmoke {
         "maximumHeapBytes" -> heap, "javaVersion" -> sys.props("java.runtime.version"),
         "sparkVersion" -> spark.version,
         "scalaVersion" -> scala.util.Properties.versionNumberString,
+        "hadoopVersion" -> org.apache.hadoop.util.VersionInfo.getVersion,
         "heapArguments" -> ManagementFactory.getRuntimeMXBean.getInputArguments.asScala
           .filter(_.startsWith("-Xmx")).toVector,
         "sqlSettings" -> Seq("spark.sql.adaptive.enabled",

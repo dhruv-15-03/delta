@@ -278,6 +278,30 @@ jobs:
                               phase.get("negativeControlBytes") == 128 and
                               phase.get("negativeControlExcludedFromTarget") is True,
                               f"Incomplete actual-reader proof: {phase.get('phase')}")
+                      require(phase.get("jdkFileReadBytes", -1) >= 0 and
+                              phase.get("vectorCompletionEventBytes", -1) >= 0 and
+                              phase.get("jdkFileReadBytes", 0) +
+                              phase.get("vectorCompletionEventBytes", 0) ==
+                              phase.get("targetReaderBytes") and
+                              phase.get("vectorEventType") == "delta.smoke.CompletedVectorRead" and
+                              phase.get("vectorCompletionIdsVerified") is True and
+                              phase.get("pendingVectorRanges") == 0 and
+                              0 <= phase.get("completedVectorRanges", -1) <= 1024 and
+                              (phase.get("vectorCompletionEventBytes") == 0 or
+                               phase.get("completedVectorRanges", 0) > 0) and
+                              phase.get("overlappedSynchronousAccounting") is False,
+                              f"Missing synchronous/vectored accounting split: {phase.get('phase')}")
+                      per_file = phase.get("perFileBytes", [])
+                      require(len(per_file) == fixture.get("targetFiles") and all(
+                          file.get("jdkFileReadBytes", -1) >= 0 and
+                          file.get("vectorCompletionEventBytes", -1) >= 0 and
+                          file.get("jdkFileReadBytes") == file.get("hadoopSynchronousBytes") and
+                          file.get("vectorCompletionEventBytes") == file.get("completedRawVectorBytes")
+                          for file in per_file
+                      ) and sum(file.get("jdkFileReadBytes", 0) +
+                                file.get("vectorCompletionEventBytes", 0) for file in per_file) ==
+                          phase.get("targetReaderBytes"),
+                          f"Per-file synchronous/vectored witness mismatch: {phase.get('phase')}")
                   if len(phases) == 3:
                       require(phases[0].get("targetFilesRead") == fixture.get("targetFiles") and
                               any(name.endswith("DeltaParquetFileFormat") for name in
