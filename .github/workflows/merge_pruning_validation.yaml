@@ -21,7 +21,7 @@ jobs:
     if: >-
       github.repository == 'dhruv-15-03/delta' &&
       github.event.repository.private == false &&
-      github.run_number == 7 &&
+      github.run_number >= 8 && github.run_number <= 9 &&
       github.run_attempt == 1
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -222,7 +222,7 @@ jobs:
 
           def check_reader_packet(phase, packet):
               prefix = f"Reader packet {phase}: "
-              require(packet.get("schemaVersion") == 1 and packet.get("phase") == phase and
+              require(packet.get("schemaVersion") == 2 and packet.get("phase") == phase and
                       packet.get("evidenceFile") == f"reader-{phase}.json",
                       prefix + "wrong identity/schema.")
               require(packet.get("diagnosticCaptureComplete") is True and
@@ -238,11 +238,14 @@ jobs:
                       prefix + "raw-recording disposition is not explicit.")
               witnesses = packet.get("pathlessReadWitnesses", [])
               require(packet.get("witnessLimit") == 8 and packet.get("stackFrameLimit") == 12 and
-                      len(witnesses) <= 8 and packet.get("witnessesOmitted") == 0,
+                      packet.get("reservedDescriptorWitnessSlots") == 1 and
+                      len(witnesses) <= 8 and packet.get("witnessesOmitted") == 0 and
+                      packet.get("eventsAggregated") ==
+                      packet.get("pathlessReadEvents", 0) - len(witnesses),
                       prefix + "witness budget/completeness failed.")
-              require(packet.get("pathlessReadEvents") == len(witnesses) ==
+              require(packet.get("pathlessReadEvents") == sum(w["eventCount"] for w in witnesses) ==
                       packet.get("nullPathEvents", 0) + packet.get("emptyPathEvents", 0) and
-                      packet.get("pathlessReadBytes") == sum(w["bytesRead"] for w in witnesses),
+                      packet.get("pathlessReadBytes") == sum(w["aggregateBytes"] for w in witnesses),
                       prefix + "unattributed aggregates do not match retained events.")
               for witness in witnesses:
                   require(witness.get("eventType") == "jdk.FileRead" and
@@ -252,6 +255,8 @@ jobs:
                           isinstance(witness.get("stackTruncated"), bool) and
                           0 <= len(witness.get("stackFrames", [])) <= 12 and
                           witness.get("stackFramesOmitted", -1) >= 0 and
+                          isinstance(witness.get("eventCount"), int) and witness["eventCount"] > 0 and
+                          witness["aggregateBytes"] == witness["bytesRead"] * witness["eventCount"] and
                           witness.get("eventSizeAvailable") is False,
                           prefix + "incomplete event witness.")
                   datetime.fromisoformat(witness["startTime"].replace("Z", "+00:00"))
@@ -269,6 +274,7 @@ jobs:
                   read_end = datetime.fromisoformat(witness["endTime"].replace("Z", "+00:00"))
                   require(witness["pathState"] == "null" and
                           witness["bytesRead"] == span["bytesRead"] == 64 and
+                          witness["eventCount"] == 1 and witness["aggregateBytes"] == 64 and
                           isinstance(witness.get("threadId"), int) and
                           witness["threadId"] == span.get("threadId") and
                           start <= read_start <= read_end <= end and
@@ -277,7 +283,33 @@ jobs:
                               "MergeSmokeAttribution$#readDescriptorControl:"
                           ) for frame in witness["stackFrames"]),
                           prefix + "descriptor classification lacks span/thread/stack evidence.")
+              shell_events = 0
+              for witness in witnesses:
+                  attribution = witness.get("attribution")
+                  if attribution == "known-non-target-descriptor-control":
+                      continue
+                  frames = witness["stackFrames"]
+                  proven = {
+                      "hadoop-3.5.0-shell-stderr-eof": any(frame in frames for frame in (
+                          "org.apache.hadoop.util.Shell$1#work:1028",
+                          "org.apache.hadoop.util.Shell$1#work:1032")),
+                      "hadoop-3.5.0-shell-stdout-drain-eof": any(frame in frames for frame in (
+                          "org.apache.hadoop.util.Shell#runCommand:1059",
+                          "org.apache.hadoop.util.Shell#runCommand:1061")),
+                      "hadoop-3.5.0-shell-stdout-parse-eof":
+                          "org.apache.hadoop.util.Shell$ShellCommandExecutor#parseExecResult:1298"
+                          in frames and "org.apache.hadoop.util.Shell#runCommand:1057" in frames,
+                  }
+                  require(proven.get(attribution, False) and witness["pathState"] == "null" and
+                          witness["stackAvailable"] is True and witness.get("endOfFile") is True and
+                          witness["bytesRead"] == witness["aggregateBytes"] == 0,
+                          prefix + "null-path event group lacks exact non-target EOF proof.")
+                  if proven.get(attribution, False):
+                      shell_events += witness["eventCount"]
               require(packet.get("knownDescriptorControlBytes") == 64 and
+                      packet.get("knownShellEofEvents") == shell_events and
+                      packet.get("knownShellEofBytes") == 0 and
+                      packet.get("pathlessReadEvents") == shell_events + len(known) and
                       packet.get("unattributedReadEvents") == 0 and
                       packet.get("unattributedReadBytes") == 0,
                       prefix + "unknown global reads have not been attributed.")
@@ -412,7 +444,9 @@ jobs:
                                   "missingTargetSyncEventRejected", "missingVectorEventRejected",
                                   "nativeDescriptorControlObserved", "emptyPathRejected",
                                   "unattributedNullPathRejected", "dataLossRejected",
-                                  "streamEscapeRejected"
+                                  "streamEscapeRejected", "missingControlProofRejected",
+                                  "perFileMismatchRejected", "pendingVectorRejected",
+                                  "overlapRejected", "rollingRetentionRejected"
                               )
                           ), "Exact parser/attribution negative controls did not pass.")
                   phases = result.get("phases", [])
@@ -476,7 +510,16 @@ jobs:
                       require(all(phase.get("dataCorrect") is True and
                                   phase.get("metricsCorrect") is True and
                                   phase.get("commitCorrect") is True and
-                                  phase.get("commitVersion") == 1 for phase in phases[1:]),
+                                  phase.get("commitVersion") == 1 and
+                                  phase.get("sourceRows") == fixture["sourceRows"] and
+                                  phase.get("targetRowsUpdated") == fixture["sourceRows"] and
+                                  phase.get("affectedRows") ==
+                                  [[fixture["sourceRows"], fixture["sourceRows"], 0, 0]] and
+                                  phase.get("sourceMaterializationReason") ==
+                                  "materializeNonDeterministicSourceNonDelta" and
+                                  phase.get("sourceMaterializationAttempts") == 1 and
+                                  phase.get("baseSnapshotVersion") == 0 and
+                                  phase.get("rowMultisetVerified") is True for phase in phases[1:]),
                               "The two MERGEs did not prove data/metric correctness.")
                   require(all(result.get("outputChecks", {}).get(key) is True for key in (
                       "roundTrip", "atomicReplacement", "syntheticFailureRecord"

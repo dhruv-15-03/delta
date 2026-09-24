@@ -661,6 +661,29 @@ private[merge] object MergeSmokeAttribution {
       stackTruncated: Boolean,
       framesOmitted: Int,
       endOfFile: Boolean) {
+    def descriptorCandidate: Boolean = pathState == "null" && bytes == descriptorBytes &&
+      !endOfFile && stackAvailable && frames.exists(_.startsWith(
+        "org.apache.spark.sql.delta.commands.merge.MergeSmokeAttribution$#readDescriptorControl:"))
+
+    def shellEofOrigin: Option[String] = {
+      // Hadoop 3.5.0 Shell.java connects these call sites to process stdout/stderr, not files.
+      if (pathState != "null" || bytes != 0L || !endOfFile || !stackAvailable) {
+        None
+      } else if (frames.contains("org.apache.hadoop.util.Shell$1#work:1028") ||
+          frames.contains("org.apache.hadoop.util.Shell$1#work:1032")) {
+        Some("hadoop-3.5.0-shell-stderr-eof")
+      } else if (frames.contains("org.apache.hadoop.util.Shell#runCommand:1059") ||
+          frames.contains("org.apache.hadoop.util.Shell#runCommand:1061")) {
+        Some("hadoop-3.5.0-shell-stdout-drain-eof")
+      } else if (frames.contains(
+          "org.apache.hadoop.util.Shell$ShellCommandExecutor#parseExecResult:1298") &&
+          frames.contains("org.apache.hadoop.util.Shell#runCommand:1057")) {
+        Some("hadoop-3.5.0-shell-stdout-parse-eof")
+      } else {
+        None
+      }
+    }
+
     def json: Map[String, Any] = Map(
       "eventType" -> "jdk.FileRead", "pathState" -> pathState, "bytesRead" -> bytes,
       "startTime" -> start.toString, "endTime" -> end.toString,
@@ -668,15 +691,57 @@ private[merge] object MergeSmokeAttribution {
       "threadNameRedacted" -> thread.exists(_.nameRedacted),
       "stackAvailable" -> stackAvailable, "stackTruncated" -> stackTruncated,
       "stackFrames" -> frames, "stackFramesOmitted" -> framesOmitted,
+      "stackSelection" -> "prefix-and-application-callers",
       "endOfFile" -> endOfFile, "eventSizeAvailable" -> false)
   }
+  case class ReadGroup(
+      representative: ReadWitness,
+      count: Long,
+      bytes: Long,
+      firstStart: Instant,
+      lastEnd: Instant) {
+    def append(read: ReadWitness): ReadGroup = copy(
+      count = Math.addExact(count, 1L), bytes = Math.addExact(bytes, read.bytes),
+      firstStart = if (read.start.isBefore(firstStart)) read.start else firstStart,
+      lastEnd = if (read.end.isAfter(lastEnd)) read.end else lastEnd)
+  }
+
+  private class WitnessSelection {
+    private var control: Option[ReadGroup] = None
+    private val groups = mutable.LinkedHashMap.empty[Vector[String], ReadGroup]
+    val problems: mutable.Set[String] = mutable.Set.empty[String]
+
+    def add(read: ReadWitness): Unit = {
+      val fresh = ReadGroup(read, 1L, read.bytes, read.start, read.end)
+      try {
+        if (read.descriptorCandidate) {
+          if (control.isDefined) problems += "duplicate-descriptor-control-read"
+          control = Some(control.map(_.append(read)).getOrElse(fresh))
+        } else {
+          val signature = read.shellEofOrigin.map(Vector(_)).getOrElse(
+            Vector(read.pathState, read.bytes.toString, read.endOfFile.toString,
+              read.stackAvailable.toString) ++ read.frames)
+          groups.get(signature) match {
+            case Some(group) => groups(signature) = group.append(read)
+            case None if groups.size < maxWitnesses - 1 => groups(signature) = fresh
+            case None => problems += "unattributed-witness-limit"
+          }
+        }
+      } catch {
+        case _: ArithmeticException => problems += "counter-overflow"
+      }
+    }
+
+    def result: Vector[ReadGroup] = control.toVector ++ groups.values.toVector
+  }
+
   case class DescriptorSpan(start: Instant, end: Instant, threadId: Option[Long], bytes: Long)
   case class Capture(
       synchronous: Map[String, Long],
       vectored: Map[String, Long],
       vectorEvents: Map[Long, (String, Long)],
       firstTargetEvent: Option[(String, Long)],
-      witnesses: Vector[ReadWitness],
+      readGroups: Vector[ReadGroup],
       pathlessEvents: Long,
       pathlessBytes: Long,
       nullPaths: Long,
@@ -688,19 +753,25 @@ private[merge] object MergeSmokeAttribution {
       dataLossEvents: Int,
       eventsRead: Int,
       complete: Boolean,
+      rollingRetention: Boolean,
       problems: Vector[String]) {
-    def descriptorWitnesses: Vector[ReadWitness] = witnesses.filter { read =>
-      read.pathState == "null" && read.bytes == descriptorBytes &&
-        read.frames.exists(_.startsWith(
-          "org.apache.spark.sql.delta.commands.merge.MergeSmokeAttribution$" +
-            "#readDescriptorControl:")) &&
+    def witnesses: Vector[ReadWitness] = readGroups.map(_.representative)
+    def descriptorGroups: Vector[ReadGroup] = readGroups.filter { group =>
+      val read = group.representative
+      group.count == 1L && group.bytes == descriptorBytes && read.descriptorCandidate &&
         descriptorSpans.exists { span =>
           span.bytes == descriptorBytes && span.threadId.isDefined &&
             span.threadId == read.thread.map(_.id) &&
             !read.start.isBefore(span.start) && !read.end.isAfter(span.end)
         }
     }
-    def unattributedEvents: Long = pathlessEvents - descriptorWitnesses.size
+    def descriptorWitnesses: Vector[ReadWitness] = descriptorGroups.map(_.representative)
+    def shellEofGroups: Vector[ReadGroup] = readGroups.filter { group =>
+      group.count > 0L && group.bytes == 0L && group.representative.shellEofOrigin.isDefined
+    }
+    def shellEofEvents: Long = shellEofGroups.map(_.count).sum
+    def representedEvents: Long = readGroups.map(_.count).sum
+    def unattributedEvents: Long = pathlessEvents - descriptorWitnesses.size - shellEofEvents
   }
 
   def enable(recording: Recording): Unit = {
@@ -751,31 +822,47 @@ private[merge] object MergeSmokeAttribution {
     val stack = Option(event.getStackTrace)
     val frames = mutable.ArrayBuffer.empty[String]
     stack.foreach { value =>
+      val prefix = mutable.ArrayBuffer.empty[String]
+      val callers = mutable.ArrayBuffer.empty[String]
       val iterator = value.getFrames.iterator()
-      while (iterator.hasNext && frames.size < maxFrames) {
+      var index = 0
+      while (iterator.hasNext) {
         val frame = iterator.next()
         val method = frame.getMethod
         val className = method.getType.getName
         val methodName = method.getName
         val safe = className.matches("[A-Za-z0-9_.$]+") &&
           methodName.matches("[A-Za-z0-9_$<>]+")
-        frames += (if (safe) {
+        val text = if (safe) {
           s"${className.take(128)}#${methodName.take(48)}:${frame.getLineNumber}"
         } else {
           "[redacted-frame]"
-        })
+        }
+        if (index < 3) {
+          prefix += text
+        } else if (callers.size < maxFrames - 3 &&
+            (className.startsWith("org.apache.hadoop.") ||
+              className.startsWith("org.apache.spark."))) {
+          callers += text
+        }
+        index += 1
       }
+      frames ++= prefix ++ callers
     }
     ReadWitness(pathState, bytes, event.getStartTime, event.getEndTime, thread,
       frames.toVector, stack.isDefined, stack.exists(_.isTruncated),
       stack.map(_.getFrames.size() - frames.size).getOrElse(0), event.getBoolean("endOfFile"))
   }
 
-  def read(recording: Path, paths: Set[String], marker: Path): Capture = {
+  def read(
+      recording: Path,
+      paths: Set[String],
+      marker: Path,
+      rollingRetention: Boolean): Capture = {
     val synchronous = mutable.Map.empty[String, Long].withDefaultValue(0L)
     val vectored = mutable.Map.empty[String, Long].withDefaultValue(0L)
     val vectors = mutable.Map.empty[Long, (String, Long)]
-    val witnesses = mutable.ArrayBuffer.empty[ReadWitness]
+    val selection = new WitnessSelection
     val spans = mutable.ArrayBuffer.empty[DescriptorSpan]
     val problems = mutable.Set.empty[String]
     var firstTargetEvent: Option[(String, Long)] = None
@@ -814,11 +901,7 @@ private[merge] object MergeSmokeAttribution {
               pathlessBytes = add(pathlessBytes, bytes)
               val state = if (rawPath == null) "null" else "empty"
               if (rawPath == null) nullPaths += 1 else emptyPaths += 1
-              if (witnesses.size < maxWitnesses) {
-                witnesses += witness(event, state, bytes)
-              } else {
-                problems += "unattributed-witness-limit"
-              }
+              selection.add(witness(event, state, bytes))
             } else {
               val path = new File(rawPath).getCanonicalPath
               if (paths.contains(path)) {
@@ -865,10 +948,11 @@ private[merge] object MergeSmokeAttribution {
     } finally {
       input.close()
     }
+    problems ++= selection.problems
     Capture(synchronous.toMap.filter(_._2 != 0L), vectored.toMap.filter(_._2 != 0L),
-      vectors.toMap, firstTargetEvent, witnesses.toVector, pathlessEvents, pathlessBytes,
+      vectors.toMap, firstTargetEvent, selection.result, pathlessEvents, pathlessBytes,
       nullPaths, emptyPaths, spans.toVector, markerBytes, otherNamedEvents, otherNamedBytes,
-      dataLossEvents, eventsRead, complete, problems.toVector.sorted)
+      dataLossEvents, eventsRead, complete, rollingRetention, problems.toVector.sorted)
   }
 
   def problems(capture: Capture, independent: Independent, paths: Set[String]): Vector[String] = {
@@ -876,12 +960,19 @@ private[merge] object MergeSmokeAttribution {
     issues ++= capture.problems
     issues ++= independent.problems
     if (!capture.complete) issues += "incomplete-recording-scan"
+    if (capture.rollingRetention) issues += "rolling-recording-retention"
     if (capture.dataLossEvents != 0) issues += "jfr-data-loss"
     if (capture.markerBytes != 128L) issues += "named-negative-control-mismatch"
     if (capture.descriptorSpans.size != 1 || capture.descriptorWitnesses.size != 1) {
       issues += "descriptor-control-not-proven"
     }
     if (capture.unattributedEvents != 0L) issues += "unattributed-global-file-read"
+    if (capture.readGroups.size > maxWitnesses ||
+        capture.representedEvents != capture.pathlessEvents ||
+        capture.readGroups.exists(group => group.count <= 0L ||
+          BigInt(group.bytes) != BigInt(group.count) * group.representative.bytes)) {
+      issues += "incomplete-pathless-event-aggregation"
+    }
     if (capture.synchronous != independent.synchronous) issues += "per-file-synchronous-mismatch"
     if (capture.vectored != independent.vectored) issues += "per-file-vector-mismatch"
     if (capture.vectorEvents != independent.completed) issues += "vector-id-or-buffer-mismatch"
@@ -930,14 +1021,14 @@ private[merge] object MergeSmokeAttribution {
       }
     }
     Map(
-      "schemaVersion" -> 1, "phase" -> label,
+      "schemaVersion" -> 2, "phase" -> label,
       "evidenceFile" -> s"reader-$label.json", "operationReturned" -> operationReturned,
       "diagnosticCaptureComplete" -> capture.complete,
       "targetCoverageStatus" -> (if (issues.isEmpty) "verified" else "inconclusive"),
       "mergeCorrectnessStatus" -> "not-evaluated-by-reader-capture",
       "covered" -> issues.isEmpty, "problems" -> issues,
       "dataLossEvents" -> capture.dataLossEvents, "recordedEventsScanned" -> capture.eventsRead,
-      "rollingRetention" -> false, "openRawStreams" -> independent.openStreams,
+      "rollingRetention" -> capture.rollingRetention, "openRawStreams" -> independent.openStreams,
       "targetFilesRead" -> paths.count { path =>
         capture.synchronous.getOrElse(path, 0L) > 0 || capture.vectored.getOrElse(path, 0L) > 0
       },
@@ -967,6 +1058,8 @@ private[merge] object MergeSmokeAttribution {
       "nullPathEvents" -> capture.nullPaths, "emptyPathEvents" -> capture.emptyPaths,
       "knownDescriptorControlEvents" -> capture.descriptorWitnesses.size,
       "knownDescriptorControlBytes" -> total(capture.descriptorWitnesses.map(_.bytes)),
+      "knownShellEofEvents" -> capture.shellEofEvents,
+      "knownShellEofBytes" -> total(capture.shellEofGroups.map(_.bytes)),
       "descriptorControlSpans" -> capture.descriptorSpans.map { span =>
         Map("startTime" -> span.start.toString, "endTime" -> span.end.toString,
           "threadId" -> span.threadId, "bytesRead" -> span.bytes)
@@ -974,14 +1067,20 @@ private[merge] object MergeSmokeAttribution {
       "unattributedReadEvents" -> capture.unattributedEvents,
       "unattributedReadBytes" ->
         Math.subtractExact(capture.pathlessBytes, total(capture.descriptorWitnesses.map(_.bytes))),
-      "pathlessReadWitnesses" -> capture.witnesses.map { read =>
-        read.json + ("attribution" -> (if (capture.descriptorWitnesses.contains(read)) {
+      "pathlessReadWitnesses" -> capture.readGroups.map { group =>
+        val read = group.representative
+        read.json ++ Map("eventCount" -> group.count, "aggregateBytes" -> group.bytes,
+          "firstStartTime" -> group.firstStart.toString, "lastEndTime" -> group.lastEnd.toString,
+          "attribution" -> (if (capture.descriptorGroups.contains(group)) {
           "known-non-target-descriptor-control"
         } else {
-          "unattributed"
+          read.shellEofOrigin.getOrElse("unattributed")
         }))
       },
-      "witnessesOmitted" -> (capture.pathlessEvents - capture.witnesses.size),
+      "witnessesOmitted" -> (capture.pathlessEvents - capture.representedEvents),
+      "eventsAggregated" -> (capture.representedEvents - capture.readGroups.size),
+      "reservedDescriptorWitnessSlots" -> 1,
+      "aggregationPolicy" -> "Each event classified before bounded signature aggregation",
       "witnessLimit" -> maxWitnesses, "stackFrameLimit" -> maxFrames,
       "otherNamedReadEvents" -> capture.otherNamedEvents,
       "otherNamedReadBytes" -> capture.otherNamedBytes,
@@ -1013,12 +1112,14 @@ private[merge] object MergeSmokeAttribution {
       .contains("per-file-synchronous-mismatch")
     val vectorRejected = problems(missingVector, independent, paths)
       .contains("vector-id-or-buffer-mismatch")
-    val emptyPath = capture.copy(witnesses =
-      capture.witnesses.map(_.copy(pathState = "empty")))
+    val emptyPath = capture.copy(readGroups = capture.readGroups.map { group =>
+      group.copy(representative = group.representative.copy(pathState = "empty"))
+    })
     val emptyRejected = problems(emptyPath, independent, paths)
       .contains("unattributed-global-file-read")
-    val unclassified = capture.copy(
-      witnesses = capture.witnesses.map(_.copy(frames = Vector.empty)))
+    val unclassified = capture.copy(readGroups = capture.readGroups.map { group =>
+      group.copy(representative = group.representative.copy(frames = Vector.empty))
+    })
     val unknownRejected = problems(unclassified, independent, paths)
       .contains("unattributed-global-file-read")
     val lossRejected = problems(capture.copy(dataLossEvents = 1), independent, paths)
@@ -1026,8 +1127,24 @@ private[merge] object MergeSmokeAttribution {
     val escapeRejected = problems(capture,
       independent.copy(problems = Vector("wrapped-stream exposure")), paths)
       .contains("wrapped-stream exposure")
+    val noControl = capture.copy(descriptorSpans = Vector.empty)
+    val missingControlRejected = problems(noControl, independent, paths)
+      .contains("descriptor-control-not-proven")
+    val changedFile = capture.copy(synchronous =
+      (capture.synchronous - path) + ((path + "-different-file") -> capture.synchronous(path)))
+    val perFileRejected = problems(changedFile, independent, paths)
+      .contains("per-file-synchronous-mismatch")
+    val pendingRejected = problems(capture, independent.copy(pending = Set(id)), paths)
+      .contains("pending-failed-or-cancelled-vector")
+    val overlapRejected = problems(capture,
+      independent.copy(problems = Vector("overlapping-synchronous-accounting")), paths)
+      .contains("overlapping-synchronous-accounting")
+    val retentionRejected = problems(capture.copy(rollingRetention = true), independent, paths)
+      .contains("rolling-recording-retention")
     require(syncRejected && vectorRejected && capture.pathlessEvents > 0 &&
-      emptyRejected && unknownRejected && lossRejected && escapeRejected,
+      emptyRejected && unknownRejected && lossRejected && escapeRejected &&
+      missingControlRejected && perFileRejected && pendingRejected &&
+      overlapRejected && retentionRejected,
       "Invalid coverage must fail even with descriptor events present.")
     Map("synthetic" -> true, "syntheticNegativeChecks" -> true,
       "hadoopCountersSynthetic" -> false, "mutationOfObservedEvents" -> true,
@@ -1036,7 +1153,104 @@ private[merge] object MergeSmokeAttribution {
       "nativeDescriptorControlObserved" -> (capture.descriptorWitnesses.size == 1),
       "emptyPathRejected" -> emptyRejected, "unattributedNullPathRejected" -> unknownRejected,
       "dataLossRejected" -> lossRejected, "streamEscapeRejected" -> escapeRejected,
+      "missingControlProofRejected" -> missingControlRejected,
+      "perFileMismatchRejected" -> perFileRejected,
+      "pendingVectorRejected" -> pendingRejected, "overlapRejected" -> overlapRejected,
+      "rollingRetentionRejected" -> retentionRejected,
       "pathlessEventsPreservedInBothMutations" -> capture.pathlessEvents)
+  }
+
+  private def selectionChecks(
+      directory: Path,
+      marker: Path,
+      observe: Recording => Unit): Map[String, Any] = {
+    val empty = Files.createFile(directory.resolve("empty.bin"))
+    val destination = directory.resolve("selection.jfr")
+    val recording = new Recording()
+    observe(recording)
+    try {
+      enable(recording)
+      recording.setMaxSize(0L)
+      recording.start()
+      val owner = new FileInputStream(empty.toFile)
+      try {
+        val descriptor = new FileInputStream(owner.getFD)
+        try {
+          (0 until 24).foreach { _ =>
+            require(descriptor.read(new Array[Byte](1)) == -1, "Expected an actual descriptor EOF.")
+          }
+        } finally {
+          descriptor.close()
+        }
+      } finally {
+        owner.close()
+      }
+      readDescriptorControl(marker)
+      // Exercise the real decoder's duplicate-ID and checked-addition branches as well.
+      emitVector(empty.toFile.getCanonicalPath, 99L, Long.MaxValue)
+      emitVector(empty.toFile.getCanonicalPath, 99L, 1L)
+      recording.stop()
+      recording.dump(destination)
+      val capture = read(destination, Set(empty.toFile.getCanonicalPath), marker,
+        recording.getMaxSize != 0L || recording.getMaxAge != null)
+      require(capture.pathlessEvents == 25 && capture.pathlessBytes == descriptorBytes &&
+        capture.descriptorWitnesses.size == 1 && capture.readGroups.size == 2 &&
+        capture.representedEvents == 25 && capture.unattributedEvents == 24 &&
+        capture.readGroups.exists(group => group.count == 24 && group.bytes == 0L) &&
+        capture.problems.contains("duplicate-vector-event") &&
+        capture.problems.contains("counter-overflow"),
+        "The real EOF burst lost control evidence, identities, or overflow guards.")
+      val eof = capture.readGroups.find(_.count == 24).get.representative
+      require(eof.end.isBefore(capture.descriptorWitnesses.head.start),
+        "The EOF regression must precede the descriptor control.")
+      val shellFrames = Vector(
+        "org.apache.hadoop.util.Shell$1#work:1028",
+        "org.apache.hadoop.util.Shell#runCommand:1059",
+        "org.apache.hadoop.util.Shell$ShellCommandExecutor#parseExecResult:1298",
+        "org.apache.hadoop.util.Shell#runCommand:1057")
+      val grouped = new WitnessSelection
+      (0 until 40).foreach { index =>
+        val proof = index % 3 match {
+          case 0 => shellFrames.take(1)
+          case 1 => shellFrames.slice(1, 2)
+          case _ => shellFrames.drop(2)
+        }
+        grouped.add(eof.copy(frames = proof))
+      }
+      grouped.add(capture.descriptorWitnesses.head)
+      val groupedCapture = capture.copy(readGroups = grouped.result, pathlessEvents = 41,
+        nullPaths = 41, problems = Vector.empty)
+      require(groupedCapture.shellEofEvents == 40 && groupedCapture.unattributedEvents == 0 &&
+        groupedCapture.readGroups.size == 4 && groupedCapture.descriptorWitnesses.size == 1,
+        "Per-event Shell EOF classification did not aggregate exact counts.")
+      val unknownPositive = eof.copy(bytes = 1L, endOfFile = false, frames = shellFrames)
+      grouped.add(unknownPositive)
+      require(unknownPositive.shellEofOrigin.isEmpty &&
+        groupedCapture.copy(readGroups = grouped.result, pathlessEvents = 42,
+          pathlessBytes = 65).unattributedEvents == 1,
+        "A positive null-path read must not inherit the EOF classification.")
+      val saturated = new WitnessSelection
+      (0 until 10).foreach { index =>
+        saturated.add(eof.copy(bytes = index.toLong + 1L, endOfFile = false))
+      }
+      saturated.add(capture.descriptorWitnesses.head)
+      require(saturated.result.size == maxWitnesses &&
+        saturated.result.exists(_.representative.descriptorCandidate) &&
+        saturated.problems.contains("unattributed-witness-limit"),
+        "The total witness budget must reserve the actual control and reject overflow.")
+      Map("realEofEventsBeforeControl" -> 24, "realControlRetained" -> true,
+        "realBurstRepresentativeCount" -> capture.readGroups.size,
+        "unknownEofEventsRemainUnattributed" -> 24,
+        "syntheticShellMetadataEvents" -> 40, "syntheticShellGroups" -> 3,
+        "unknownPositiveRejected" -> true, "groupOverflowRejected" -> true,
+        "duplicateVectorIdRejected" -> true, "counterOverflowRejected" -> true,
+        "totalDetailedWitnessLimit" -> maxWitnesses)
+    } finally {
+      recording.close()
+      observe(null)
+      Files.deleteIfExists(destination)
+      Files.deleteIfExists(empty)
+    }
   }
 
   def verifyControls(directory: Path, observe: Recording => Unit): Map[String, Any] = {
@@ -1071,14 +1285,19 @@ private[merge] object MergeSmokeAttribution {
       recorder.stop()
       recorder.dump(destination)
       require(Files.size(destination) <= 2L * 1024 * 1024, "Parser fixture recording too large.")
-      val capture = read(destination, Set(path), marker)
+      val capture = read(destination, Set(path), marker,
+        recorder.getMaxSize != 0L || recorder.getMaxAge != null)
       val independent = Independent(Map(path -> 64L), Map(path -> 16L),
         Map(1L -> (path -> 16L)), Set.empty,
         Vector(Stream(1L, path, 64L, true, "org.apache.hadoop.fs.BufferedFSInputStream", 0L)),
         0, Vector.empty)
       val negatives = negativeChecks(capture, independent, Set(path))
+      recorder.close()
+      observe(null)
+      val selection = selectionChecks(directory, marker, observe)
       negatives ++ Map("synthetic" -> true, "hadoopCountersSynthetic" -> true,
-        "controlWitness" -> capture.descriptorWitnesses.head.json)
+        "controlWitness" -> capture.descriptorWitnesses.head.json,
+        "witnessSelectionChecks" -> selection)
     } finally {
       recorder.close()
       observe(null)
@@ -1254,7 +1473,8 @@ private[merge] object MergeSourcePruningSmoke {
         recorder.dump(destination)
         recordingBytes = Some(Files.size(destination))
         require(recordingBytes.get <= maxRecordingBytes, "JFR dump budget exceeded.")
-        capture = Some(MergeSmokeAttribution.read(destination, paths, marker))
+        capture = Some(MergeSmokeAttribution.read(destination, paths, marker,
+          recorder.getMaxSize != 0L || recorder.getMaxAge != null))
         budget.check()
       }
       if (label == "actual-parquet-scan" && failures.isEmpty) {
@@ -1502,6 +1722,13 @@ private[merge] object MergeSourcePruningSmoke {
               s"MERGE INTO delta.`${target.getCanonicalPath}` t USING pruning_smoke_source s " +
                 s"ON t.key = s.key$condition WHEN MATCHED THEN UPDATE SET value = s.value")
           }
+        report("lastMergeResult") = Map("phase" -> label,
+          "affectedRows" -> rows.toVector.map(_.toSeq), "sourceRows" -> stats.source.rows,
+          "targetRowsUpdated" -> stats.targetRowsUpdated,
+          "sourceMaterializationReason" -> stats.materializeSourceReason,
+          "sourceMaterializationAttempts" -> stats.materializeSourceAttempts,
+          "commitVersion" -> stats.commitVersion)
+        save()
         require(rows.toSeq == Seq(Row(sourceRows, sourceRows, 0L, 0L)) &&
           stats.source.rows.contains(sourceRows) && stats.targetRowsUpdated == sourceRows,
           "The smoke returned incorrect source or affected-row metrics.")
@@ -1518,7 +1745,11 @@ private[merge] object MergeSourcePruningSmoke {
         report("mergeCorrectnessStatus") = if (merges == 2) "verified" else "partially-verified"
         phases += observed ++ Map("dataCorrect" -> true, "metricsCorrect" -> true,
           "commitCorrect" -> true, "commitVersion" -> stats.commitVersion,
-          "sourceMaterializationReason" -> stats.materializeSourceReason)
+          "sourceRows" -> stats.source.rows, "targetRowsUpdated" -> stats.targetRowsUpdated,
+          "affectedRows" -> rows.toVector.map(_.toSeq),
+          "sourceMaterializationReason" -> stats.materializeSourceReason,
+          "sourceMaterializationAttempts" -> stats.materializeSourceAttempts,
+          "baseSnapshotVersion" -> deltaLog.update().version, "rowMultisetVerified" -> true)
         save()
       }
       activeBudget.check()
